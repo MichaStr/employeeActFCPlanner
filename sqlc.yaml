@@ -1,0 +1,45 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "queries/"
+    schema: "migrations/"
+    gen:
+      go:
+        package: "db"
+        out: "internal/db"
+        sql_package: "pgx/v5"
+
+        # Emit a Querier interface so the application layer can mock the DB in tests.
+        emit_interface: true
+
+        # JSON tags on every struct field for API serialisation.
+        emit_json_tags: true
+
+        # Return []T{} instead of nil for empty result sets.
+        emit_empty_slices: true
+
+        # Nullable columns become Go pointer types (*T) instead of pgtype wrappers.
+        # This keeps the generated structs clean when pgx/v5 is the driver.
+        emit_pointers_for_null_types: true
+
+        overrides:
+          # UUIDs → github.com/google/uuid.UUID
+          # pgx/v5 natively encodes/decodes this type when registered via pgxuuid.
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type:   "UUID"
+
+          # NUMERIC(6,4) → github.com/shopspring/decimal.Decimal
+          # Avoids float64 rounding errors for FTE values (0.5, 0.75, etc.).
+          # pgx/v5 driver must register the shopspring codec at connection time.
+          - db_type: "pg_catalog.numeric"
+            go_type:
+              import: "github.com/shopspring/decimal"
+              type:   "Decimal"
+
+          # JSONB → json.RawMessage
+          # Keeps the audit changed_fields payload as raw bytes — the application
+          # unmarshals only when it needs to display a diff.
+          - db_type: "jsonb"
+            go_type: "encoding/json.RawMessage"

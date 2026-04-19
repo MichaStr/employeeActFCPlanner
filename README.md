@@ -119,12 +119,24 @@ CHECK ((status = 'archived' AND archived_at IS NOT NULL AND archived_by IS NOT N
     OR (status = 'working'  AND archived_at IS NULL     AND archived_by IS NULL))
 ```
 
-## Planned next steps
+## Repository structure
 
-- `migrations/001_initial_schema.sql` — Goose migration (tables + all constraints above)
-- `migrations/002_seed_lookups.sql` — seed data for `classification_types`, `employee_groups`, `system_config`
-- `sqlc.yaml` — sqlc configuration targeting `pgx/v5`
-- `queries/` — sqlc-annotated SQL files for the common query patterns
+```
+migrations/
+  001_initial_schema.sql   All tables, FK constraints, CHECK constraints, indexes
+  002_seed_lookups.sql     Seed data: classification_types, employee_groups, system_config
+  003_audit_trigger.sql    PL/pgSQL AFTER trigger that writes to forecast_entry_audit
+  004_perf_indexes.sql     Wider INCLUDE indexes for index-only scans (PG18 optimised)
+
+queries/
+  lookups.sql              classification_types, employee_groups, system_config
+  costcenters.sql          Hierarchy traversal (WITH RECURSIVE)
+  actuals.sql              Import runs, actuals rollup, MoM delta
+  forecast_versions.sql    Version lifecycle: create, archive, chain walk
+  forecast_entries.sql     SCD Type 2 ops, monthly CC rollup, version diff
+
+sqlc.yaml                  sqlc v2 config — pgx/v5 driver, uuid + decimal overrides
+```
 
 ## Toolchain
 

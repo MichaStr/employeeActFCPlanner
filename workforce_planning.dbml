@@ -385,3 +385,149 @@ Trigger pseudocode:
   AFTER UPDATE SET is_deleted = false (undo) → action = RESTORE
 '''
 }
+
+
+#########################################################################################################################
+
+---
+  Migration 001 — Initial schema
+
+  Creation order matters — tables are created bottom-up by dependency so every REFERENCES points to a table that already exists:
+
+  1. costcenters is special: it references itself via parent_id. PostgreSQL lets you add a self-referential FK after the table exists, so the table is created first without the FK, then ALTER TABLE … ADD CONSTRAINT adds it.
+  2. Lookup tables (employee_groups, classification_types) have no dependencies — created next.
+  3. users is created before system_config, planning_containers, and anything else that references it.
+  4. employees and planning_containers come before import_runs / employee_actuals.
+  5. forecast_versions references itself via source_version_id — same self-FK approach as costcenters.
+  6. forecast_entries comes last in the schema because it references almost every other table.
+  7. forecast_entry_audit references forecast_entries and forecast_versions, so it is last.
+
+  The six constraints from DBML notes are all added here as named CONSTRAINT clauses on forecast_entries and forecast_versions:
+
+  ┌───────────────────────────────┬──────────────────────────────────────────────────────────────┐
+  │        Constraint name        │                       What it enforces                       │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ chk_fe_subject_exclusive      │ Exactly one of employee_id / container_id is non-null        │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ chk_fe_temporal               │ valid_to > valid_from (or valid_to is null)                  │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ chk_fe_valid_from_month_start │ valid_from is always the 1st of a month                      │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ chk_fe_soft_delete            │ All three soft-delete columns set together or all absent     │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ chk_fv_archived_consistency   │ archived_at/archived_by only set when status = 'archived'    │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ uq_fc_versions_one_working    │ Partial unique index — at most one working version at a time │
+  └───────────────────────────────┴──────────────────────────────────────────────────────────────┘
+
+  The partial index is the most important one to understand: a regular UNIQUE (status) would block more than one archived row, which would break the entire version history. A WHERE status = 'working' partial index only
+  enforces uniqueness within the subset of working rows.
+
+  Indexes on forecast_entries use two techniques:
+  - WHERE is_deleted = false partial indexes — the active dataset is almost always queried, so this cuts index size significantly
+  - INCLUDE (valid_to) on the employee/container lookup indexes — avoids a heap fetch when valid_to is checked in the WHERE clause, making the active-row query index-only
+
+  ---
+  Migration 002 — Seed data
+
+  Inserts the minimum required rows so the application can function:
+  - classification_types — the four starting values for direct_indirect (direct, indirect, overhead, contractor). More can be added via INSERT at any time without touching the schema.
+  - employee_groups — five example groups. These codes should be aligned with actual SAP empl_group values before the first import.
+  - system_config — the three known config keys with their defaults. The application reads fc_horizon_months at forecast creation time and stores the value on the forecast_versions row, so changing it later only affects new
+  versions.
+
+  ---
+  Migration 003 — Audit trigger
+
+  Requires -- +goose StatementBegin / -- +goose StatementEnd because the CREATE FUNCTION body contains semicolons inside the $$ block — without the wrappers, Goose would split the function definition at every internal
+  semicolon and fail.
+
+  How the trigger works:
+
+  - INSERT → logs action INSERT, no changed_fields (the new row is reachable via the FK)
+  - UPDATE → builds a diff object with only the columns that actually changed, using IS DISTINCT FROM (which handles NULL correctly, unlike !=)
+  - UPDATE where is_deleted flips false → true → logged as DELETE
+  - UPDATE where is_deleted flips true → false → logged as RESTORE
+  - DELETE (hard delete, not expected in normal operation) → stores the full outgoing row under "deleted_snapshot"
+
+  The acting user is read from the PostgreSQL session variable app.current_user_id. The application must set this before any write:
+  SET LOCAL app.current_user_id = '<user-uuid>';
+  -- then perform the INSERT/UPDATE
+  SET LOCAL scopes it to the current transaction, so it is safe with connection pools.
+
+✻ Churned for 3m 31s
+
+#########################################################################################################################################
+
+
+
+● All files are written. Here is the detailed explanation you asked for.
+
+  ---
+  sqlc.yaml — three non-obvious choices
+
+  emit_pointers_for_null_types: true
+  By default, sqlc wraps nullable columns in pgtype.XXX structs (e.g. pgtype.Text). With this flag set, nullable columns become *string, *uuid.UUID, etc. — ordinary Go pointer types. This is cleaner for application code that
+   just checks if row.DeletedBy != nil rather than if row.DeletedBy.Valid.
+
+  uuid → github.com/google/uuid.UUID
+  The pgx/v5 driver ships with its own pgtype.UUID type (a [16]byte plus a validity flag). Overriding to google/uuid gives the rest of the application a stable, well-known type with string parsing, marshalling, and
+  comparison helpers. The pgx connection pool needs pgxuuid.Register(conn.TypeMap()) called once on startup.
+
+  pg_catalog.numeric → github.com/shopspring/decimal.Decimal
+  FTE values like 0.5000, 0.7500 must round-trip without floating-point error. float64 cannot represent these exactly. shopspring/decimal is an arbitrary-precision decimal that encodes/decodes directly with pgx/v5 (requires
+  pgxdecimal.Register(conn.TypeMap()) at startup).
+
+  ---
+  migrations/004_perf_indexes.sql — why a separate migration
+
+  The root problem identified in the original 001 indexes: idx_fe_version_cc_from was keyed on (version_id, costcenter_id, valid_from) but the two columns needed to answer the monthly rollup query — valid_to and fte — were
+  not in the index. PostgreSQL therefore had to do a heap fetch for every row the index matched.
+
+  Adding INCLUDE (valid_to, fte) makes the rollup a fully index-only scan: the planner reads only the index B-tree leaf pages and never touches the heap. At 1000 employees × 18 months this eliminates ~18 000 heap page reads
+  per rollup call.
+
+  The same logic applies to the employee/container active-row indexes: INCLUDE (fte, costcenter_id, classification_id, employee_group_id) was added so that the version diff CTEs can read all their projected columns from the
+  index too.
+
+  The new open-ended-row indexes (idx_fe_version_empl_open, idx_fe_version_cont_open) are a targeted fix for the SCD "close current row" UPDATE. Finding the single valid_to IS NULL row previously required the planner to scan
+   the (version_id, employee_id, valid_from) key range and check valid_to via INCLUDE on every match. A dedicated partial index WHERE valid_to IS NULL AND is_deleted = false reduces that to a 2–3 page lookup regardless of
+  how many historical rows exist for the employee.
+
+  ---
+  Query design decisions
+
+  CROSS JOIN LATERAL in MonthlyForecastRollupByCC
+
+  The naive version joins generate_series to forecast_entries with a regular JOIN. The planner sees it as a many-to-many join and may choose a hash join, which means scanning the entire forecast_entries partition for the
+  version once and hashing it — wasteful if only 3 of the 18 months have any entries.
+
+  CROSS JOIN LATERAL forces a nested-loop strategy: the subquery re-runs for each month value from generate_series. Each iteration does an index seek on (version_id, costcenter_id, valid_from) and returns only the rows
+  active for that month. For a typical rolling forecast (most employees unchanged most months) this is far cheaper. The INCLUDE (valid_to, fte) index (migration 004) makes each nested iteration index-only.
+
+  WITH ... AS MATERIALIZED in the diff queries and ActualsMoMDelta
+
+  In PostgreSQL 12+, CTEs without side effects are inlined by default — the planner treats them as subqueries and may merge them. For the diff queries this is dangerous: without MATERIALIZED, the planner might try to
+  evaluate both CTEs as a single merged scan, losing the ability to choose the best index for each version_id separately. AS MATERIALIZED tells the planner "execute this CTE exactly once, cache the result, do not inline". As
+   a side effect, PG18's parallel query executor can schedule both materialized CTEs concurrently since they have no data dependency on each other.
+
+  IS DISTINCT FROM in the diff WHERE clause
+
+  The diff WHERE uses IS DISTINCT FROM rather than != for every comparison. This is necessary because several columns are nullable (e.g. classification_id). NULL != NULL is NULL (unknown) in SQL, which would cause rows where
+   both versions have NULL classification to appear as differences. IS DISTINCT FROM returns false when both sides are NULL, so null-to-null is correctly treated as "no change".
+
+  Separate queries for employees vs containers
+
+  CloseEmployeeForecastEntry and CloseContainerForecastEntry are two queries rather than one with a conditional. The reason is indexes: the close-row UPDATE must hit idx_fe_version_empl_open or idx_fe_version_cont_open (the
+  open-ended-row partial indexes from migration 004). A combined query with (employee_id = $e OR container_id = $c) would force a bitmap OR scan across both indexes — more overhead than two targeted single-row lookups, and
+  the application always knows which type it is dealing with.
+
+  sqlc.narg() vs sqlc.arg()
+
+  sqlc.narg(name) generates a Go parameter of type *T (pointer, nullable). It is used wherever the schema column is nullable — source_version_id, deleted_by, classification_id, etc. sqlc.arg(name) generates T (non-pointer,
+  required). Mixing the two correctly means the generated Go structs precisely mirror the NOT NULL constraints in the schema, so misuse is caught at compile time.
+
+✻ Brewed for 7m 15s
+
+
+#############################################################################################################################################################################
