@@ -250,22 +250,22 @@ ORDER BY gs.month_start, fe.costcenter_id;
 -- large enough to trigger parallelism.  MATERIALIZED makes the independence
 -- of the two scans explicit to the planner.
 WITH version_a AS MATERIALIZED (
-    SELECT costcenter_id, SUM(fte) AS total_fte
-    FROM   forecast_entries
-    WHERE  version_id = sqlc.arg(version_a_id)
-      AND  is_deleted  = false
-      AND  valid_from <= sqlc.arg(month_start)::DATE
-      AND  (valid_to IS NULL OR valid_to > sqlc.arg(month_start)::DATE)
-    GROUP  BY costcenter_id
+    SELECT fe.costcenter_id, SUM(fe.fte) AS total_fte
+    FROM   forecast_entries fe
+    WHERE  fe.version_id = sqlc.arg(version_a_id)
+      AND  fe.is_deleted  = false
+      AND  fe.valid_from <= sqlc.arg(month_start)::DATE
+      AND  (fe.valid_to IS NULL OR fe.valid_to > sqlc.arg(month_start)::DATE)
+    GROUP  BY fe.costcenter_id
 ),
 version_b AS MATERIALIZED (
-    SELECT costcenter_id, SUM(fte) AS total_fte
-    FROM   forecast_entries
-    WHERE  version_id = sqlc.arg(version_b_id)
-      AND  is_deleted  = false
-      AND  valid_from <= sqlc.arg(month_start)::DATE
-      AND  (valid_to IS NULL OR valid_to > sqlc.arg(month_start)::DATE)
-    GROUP  BY costcenter_id
+    SELECT fe.costcenter_id, SUM(fe.fte) AS total_fte
+    FROM   forecast_entries fe
+    WHERE  fe.version_id = sqlc.arg(version_b_id)
+      AND  fe.is_deleted  = false
+      AND  fe.valid_from <= sqlc.arg(month_start)::DATE
+      AND  (fe.valid_to IS NULL OR fe.valid_to > sqlc.arg(month_start)::DATE)
+    GROUP  BY fe.costcenter_id
 )
 SELECT
     COALESCE(a.costcenter_id, b.costcenter_id)      AS costcenter_id,
@@ -273,9 +273,9 @@ SELECT
     b.total_fte                                      AS fte_version_b,
     COALESCE(b.total_fte, 0) - COALESCE(a.total_fte, 0) AS fte_delta
 FROM  version_a a
-FULL  OUTER JOIN version_b b USING (costcenter_id)
+FULL  OUTER JOIN version_b b ON a.costcenter_id = b.costcenter_id
 WHERE a.total_fte IS DISTINCT FROM b.total_fte
-ORDER BY costcenter_id;
+ORDER BY COALESCE(a.costcenter_id, b.costcenter_id);
 
 
 -- name: DiffVersionsByEmployee :many
@@ -295,33 +295,33 @@ ORDER BY costcenter_id;
 -- (from migration 004) for index-only scans on the key columns.
 WITH version_a AS MATERIALIZED (
     SELECT
-        COALESCE(employee_id::TEXT, container_id::TEXT) AS subject_key,
-        employee_id,
-        container_id,
-        costcenter_id,
-        classification_id,
-        employee_group_id,
-        fte
-    FROM  forecast_entries
-    WHERE version_id = sqlc.arg(version_a_id)
-      AND is_deleted  = false
-      AND valid_from <= sqlc.arg(month_start)::DATE
-      AND (valid_to IS NULL OR valid_to > sqlc.arg(month_start)::DATE)
+        COALESCE(fe.employee_id::TEXT, fe.container_id::TEXT) AS subject_key,
+        fe.employee_id,
+        fe.container_id,
+        fe.costcenter_id,
+        fe.classification_id,
+        fe.employee_group_id,
+        fe.fte
+    FROM  forecast_entries fe
+    WHERE fe.version_id = sqlc.arg(version_a_id)
+      AND fe.is_deleted  = false
+      AND fe.valid_from <= sqlc.arg(month_start)::DATE
+      AND (fe.valid_to IS NULL OR fe.valid_to > sqlc.arg(month_start)::DATE)
 ),
 version_b AS MATERIALIZED (
     SELECT
-        COALESCE(employee_id::TEXT, container_id::TEXT) AS subject_key,
-        employee_id,
-        container_id,
-        costcenter_id,
-        classification_id,
-        employee_group_id,
-        fte
-    FROM  forecast_entries
-    WHERE version_id = sqlc.arg(version_b_id)
-      AND is_deleted  = false
-      AND valid_from <= sqlc.arg(month_start)::DATE
-      AND (valid_to IS NULL OR valid_to > sqlc.arg(month_start)::DATE)
+        COALESCE(fe.employee_id::TEXT, fe.container_id::TEXT) AS subject_key,
+        fe.employee_id,
+        fe.container_id,
+        fe.costcenter_id,
+        fe.classification_id,
+        fe.employee_group_id,
+        fe.fte
+    FROM  forecast_entries fe
+    WHERE fe.version_id = sqlc.arg(version_b_id)
+      AND fe.is_deleted  = false
+      AND fe.valid_from <= sqlc.arg(month_start)::DATE
+      AND (fe.valid_to IS NULL OR fe.valid_to > sqlc.arg(month_start)::DATE)
 )
 SELECT
     COALESCE(a.subject_key,      b.subject_key)      AS subject_key,
@@ -342,7 +342,7 @@ WHERE a.costcenter_id     IS DISTINCT FROM b.costcenter_id
    OR a.classification_id IS DISTINCT FROM b.classification_id
    OR a.employee_group_id IS DISTINCT FROM b.employee_group_id
    OR a.fte               IS DISTINCT FROM b.fte
-ORDER BY subject_key;
+ORDER BY COALESCE(a.subject_key, b.subject_key);
 
 
 -- ── Audit history ─────────────────────────────────────────────────────────────

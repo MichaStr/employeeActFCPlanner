@@ -1,15 +1,27 @@
-# Ignore node_modules and dependency directories
+# Dependencies
 node_modules/
 vendor/
 
-# Ignore build artifacts
+# Build artifacts
 dist/
 build/
 tmp/
-*.log
+bin/
 *.exe
+*.log
 
-# Ignore environment and secret files
+# Frontend compiled assets (built by npm/vite)
+web/dist/
+
+# Environment and secrets — ignore real env files, keep the example template
 .env
-.gatorconfig_example.json
+.env.local
+.env.development
+.env.production
+.env.staging
 config.json
+.gatorconfig_example.json
+
+# Go test cache / coverage
+coverage.out
+*.test

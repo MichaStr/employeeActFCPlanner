@@ -101,16 +101,16 @@ RETURNING *;
 WITH RECURSIVE chain AS MATERIALIZED (
     -- Anchor: the requested start version
     SELECT
-        id,
-        label,
-        status,
-        period_year,
-        period_month,
-        source_version_id,
-        archived_at,
+        fv.id,
+        fv.label,
+        fv.status,
+        fv.period_year,
+        fv.period_month,
+        fv.source_version_id,
+        fv.archived_at,
         1 AS position
-    FROM  forecast_versions
-    WHERE id = sqlc.arg(start_version_id)
+    FROM  forecast_versions fv
+    WHERE fv.id = sqlc.arg(start_version_id)
 
     UNION ALL
 

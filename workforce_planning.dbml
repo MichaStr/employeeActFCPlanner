@@ -577,3 +577,341 @@ Trigger pseudocode:
 ✻ Brewed for 3m 6s
 
 #############################################################################################################################################################################
+
+
+All five fixes applied. Here's exactly what was wrong and why each fix works:
+
+  ---
+  Root cause
+
+  sqlc's PostgreSQL parser resolves column names by looking through CTEs to their underlying tables. When two CTEs both query the same
+  table (e.g. forecast_entries or employee_actuals), any column that table owns is visible from both CTEs simultaneously in the outer
+  query scope — and sqlc flags it as ambiguous, even if the column isn't referenced in the outer SELECT at all.
+
+  The recursive CTE anchor/recursion alias mismatch is a separate but related issue: sqlc sees two different "providers" of a column when
+  the anchor uses an unaliased table and the recursion uses an aliased one.
+
+  ---
+  Fix-by-fix
+
+  ┌─────────────────────────────┬──────────────────────────┬────────────────────────────────────────┬─────────────────────────────────┐
+  │            Error            │          Query           │             What was wrong             │               Fix               │
+  ├─────────────────────────────┼──────────────────────────┼────────────────────────────────────────┼─────────────────────────────────┤
+  │ actuals.sql:164             │                          │ Both prev/curr CTEs query              │ Added ea alias + ea. prefix in  │
+  │ import_run_id               │ ActualsMoMDelta          │ employee_actuals without alias — sqlc  │ both CTEs                       │
+  │                             │                          │ sees import_run_id from both           │                                 │
+  ├─────────────────────────────┼──────────────────────────┼────────────────────────────────────────┼─────────────────────────────────┤
+  │                             │                          │ FULL OUTER JOIN … USING                │ Replaced USING with ON          │
+  │ actuals.sql:164             │ Same                     │ (costcenter_id) causes sqlc to merge   │ curr.costcenter_id =            │
+  │                             │                          │ columns and then re-scan the           │ prev.costcenter_id              │
+  │                             │                          │ underlying table providers             │                                 │
+  ├─────────────────────────────┼──────────────────────────┼────────────────────────────────────────┼─────────────────────────────────┤
+  │                             │                          │ Anchor uses unaliased costcenters;     │ Added cc alias to anchor,       │
+  │ costcenters.sql:105 id      │ GetCostcenterDescendants │ recursion uses aliased costcenters c — │ prefixed all anchor columns     │
+  │                             │                          │  two providers of id                   │ with cc.                        │
+  ├─────────────────────────────┼──────────────────────────┼────────────────────────────────────────┼─────────────────────────────────┤
+  │                             │                          │ Both CTEs query forecast_entries       │ Added fe alias in both CTEs;    │
+  │ forecast_entries.sql:267    │ DiffVersionsByCC         │ without alias; USING (costcenter_id)   │ replaced USING with ON          │
+  │ version_id                  │                          │ amplifies the look-through             │ a.costcenter_id =               │
+  │                             │                          │                                        │ b.costcenter_id                 │
+  ├─────────────────────────────┼──────────────────────────┼────────────────────────────────────────┼─────────────────────────────────┤
+  │ forecast_entries.sql:321    │ DiffVersionsByEmployee   │ Same — both CTEs query                 │ Added fe alias + fe. prefix in  │
+  │ version_id                  │                          │ forecast_entries without alias         │ both CTEs                       │
+  ├─────────────────────────────┼──────────────────────────┼────────────────────────────────────────┼─────────────────────────────────┤
+  │ forecast_versions.sql:113   │                          │ Anchor uses unaliased                  │ Added fv alias to anchor,       │
+  │ id                          │ GetVersionChain          │ forecast_versions; recursion uses      │ prefixed anchor columns with    │
+  │                             │                          │ forecast_versions fv                   │ fv.                             │
+  └─────────────────────────────┴──────────────────────────┴────────────────────────────────────────┴─────────────────────────────────┘
+
+  The ORDER BY costcenter_id at the end of the diff queries was also changed to ORDER BY COALESCE(a.costcenter_id, b.costcenter_id) since
+  after replacing USING with ON, the merged column no longer exists and the bare name would itself be ambiguous.
+
+✻ Brewed for 3m 33s
+
+#############################################################################################################################################################################
+
+✻ Brewed for 3m 33s
+
+> now I got only one error:  sqlc generate
+  # package db
+  sql\queries\forecast_entries.sql:296:1: column reference "subject_key" is ambiguous: if you want to skip this validation, set
+  'strict_order_by' to false
+
+● Same pattern as the USING fixes — subject_key exists in both CTEs so the bare name in ORDER BY is ambiguous. One-line fix:
+
+● Update(sql\queries\forecast_entries.sql)
+  ⎿  Added 1 line, removed 1 line
+      342     OR a.classification_id IS DISTINCT FROM b.classification_id
+      343     OR a.employee_group_id IS DISTINCT FROM b.employee_group_id
+      344     OR a.fte               IS DISTINCT FROM b.fte
+      345 -ORDER BY subject_key;
+      345 +ORDER BY COALESCE(a.subject_key, b.subject_key);
+      346
+      347
+      348  -- ── Audit history ─────────────────────────────────────────────────────────────
+
+● ORDER BY subject_key was ambiguous for the same reason as before: sqlc sees subject_key coming from both version_a a and version_b b.
+  The SELECT aliases COALESCE(a.subject_key, b.subject_key) AS subject_key, but sqlc resolves ORDER BY against the input columns before
+  the output alias is applied, so it finds two candidates.
+
+  The fix ORDER BY COALESCE(a.subject_key, b.subject_key) matches exactly what the SELECT already computes, so the generated Go struct
+  field will still be SubjectKey string. No semantic change — same query plan.
+  
+############################################################################################################################################################################
+#############################################################################################################################################################################
+############################################################################################################################################################################# 
+
+
+ User approved Claude's plan
+  ⎿  Plan saved to: C:\Users\Micha\.claude\plans\sleepy-conjuring-wreath.md · /plan to edit
+     Go Project Folder Structure — CLI + WebServer UI
+
+     Context
+
+     The workforceDbSchema project already has a complete PostgreSQL schema: Goose migrations (sql/migrations/), sqlc query files
+     (sql/queries/), and generated Go code (internal/db/). The next step is to add Go application code: a CLI tool (import runner, admin
+     ops, month rollover) and a WebServer (REST API + WebUI table). No go.mod exists yet — this is a greenfield Go module on top of a
+     finished schema.
+
+     ---
+     Recommended Directory Layout
+
+     workforceDbSchema/
+     ├── go.mod                          # module: github.com/<you>/workforce-planning
+     ├── go.sum
+     ├── Makefile                        # build, run, migrate, generate shortcuts
+     │
+     ├── cmd/
+     │   ├── cli/
+     │   │   └── main.go                 # CLI entry point (Cobra root + subcommands)
+     │   └── server/
+     │       └── main.go                 # HTTP server entry point
+     │
+     ├── internal/
+     │   ├── db/                         # ← existing, sqlc-generated (do not edit)
+     │   ├── config/
+     │   │   └── config.go               # env vars + Config struct (DATABASE_URL, PORT, …)
+     │   ├── service/
+     │   │   ├── actuals.go              # SAP import, CopyFrom bulk insert
+     │   │   ├── forecast.go             # SCD write pair, version lifecycle, rollover
+     │   │   └── reporting.go            # monthly rollup, version diff
+     │   ├── api/
+     │   │   ├── handler/
+     │   │   │   ├── forecast.go         # HTTP handlers — forecast CRUD
+     │   │   │   ├── actuals.go          # HTTP handlers — import & actuals read
+     │   │   │   └── costcenter.go       # HTTP handlers — CC hierarchy
+     │   │   ├── middleware/
+     │   │   │   ├── auth.go             # JWT / session check
+     │   │   │   └── logger.go           # structured request logging
+     │   │   └── router.go               # chi router wiring
+     │   └── cli/
+     │       ├── import.go               # "wfp import <file>" subcommand
+     │       ├── rollover.go             # "wfp rollover" subcommand
+     │       └── version.go              # "wfp version list/archive" subcommands
+     │
+     ├── web/                            # frontend static assets (optional)
+     │   └── dist/                       # compiled JS/CSS (gitignored, built by npm)
+     │
+     ├── sql/                            # ← existing
+     │   ├── migrations/
+     │   └── queries/
+     │
+     └── docs/                           # ← existing
+         └── sqlc-usage.md
+
+     ---
+     Key Decisions
+
+     Module name
+
+     github.com/<your-github-user>/workforce-planning
+     Use a real or placeholder GitHub path — Go tooling requires a valid module path.
+
+     CLI framework: Cobra
+
+     - cmd/cli/main.go creates the Cobra root command and calls Execute().
+     - Each subcommand (import, rollover, version) lives in internal/cli/ so it can be tested without invoking main.
+     - Cobra handles --help, flag parsing, and nested subcommand routing without boilerplate.
+
+     HTTP router: chi
+
+     - Lightweight, uses standard http.Handler, and supports middleware chaining cleanly.
+     - If the UI is a SPA (React/HTMX), web/dist/ is embedded into the binary with //go:embed web/dist in cmd/server/main.go.
+     - If the UI is server-side HTML templates, add internal/api/templates/ with html/template files.
+
+     Service layer (internal/service/)
+
+     - Sits between HTTP handlers / CLI commands and internal/db/.
+     - Holds all business logic: the SCD two-step write pair, month rollover (archive + seed), bulk CopyFrom import.
+     - Takes db.Querier (the sqlc-generated interface) as a dependency → easy to mock in tests.
+     - Wraps multi-step operations in a transaction using the WithTx pattern from docs/sqlc-usage.md.
+
+     Config (internal/config/)
+
+     - Single Config struct loaded from environment variables (os.Getenv or godotenv for .env files).
+     - Required fields: DATABASE_URL, PORT (server). Optional: LOG_LEVEL, JWT_SECRET.
+     - Both cmd/cli/main.go and cmd/server/main.go call config.Load() at startup before connecting to the DB.
+
+     Audit session variable placement
+
+     - SET LOCAL app.current_user_id = $1 belongs inside each service-layer transaction, not in HTTP middleware — so that CLI commands
+     also set it correctly for the audit trigger.
+
+     ---
+     Files to Create
+
+     ┌──────────────────────────────────┬────────────────────────────────────────────────────────────────────────────┐
+     │               File               │                              What goes in it                               │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ go.mod                           │ go mod init github.com/<you>/workforce-planning then go mod tidy           │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ Makefile                         │ targets: build, run-server, run-cli, migrate-up, sqlc-gen, test            │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ cmd/cli/main.go                  │ Cobra root command + Execute(); registers subcommands from internal/cli/   │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ cmd/server/main.go               │ pgxpool init (with codec registration), router wiring, http.ListenAndServe │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/config/config.go        │ Config struct + Load() (*Config, error)                                    │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/service/forecast.go     │ ApplyChange (SCD pair), ArchiveAndSeed (rollover), GetRollup, DiffVersions │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/service/actuals.go      │ RunImport (CopyFrom bulk), import run management                           │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/api/router.go           │ chi router with middleware stack and handler registration                  │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/api/handler/forecast.go │ GET /versions, POST /versions, PUT /entries/:id, GET /rollup               │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/cli/import.go           │ Cobra import subcommand wired to service.RunImport                         │
+     ├──────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+     │ internal/cli/rollover.go         │ Cobra rollover subcommand wired to service.ArchiveAndSeed                  │
+     └──────────────────────────────────┴────────────────────────────────────────────────────────────────────────────┘
+
+     ---
+     Verification
+
+     1. go mod tidy resolves all imports without errors.
+     2. go build ./cmd/cli/ and go build ./cmd/server/ both succeed.
+     3. ./cli --help shows root command with import, rollover, version subcommands listed.
+     4. ./server starts, connects to the DB, and GET /healthz responds 200.
+     5. go test ./internal/service/... runs service-layer unit tests (using the mock db.Querier interface).
+
+● Now I'll build out the structure. Let me first check what exists and run the module init.
+
+  Listed 2 directories (ctrl+o to expand)
+
+● Let me read the generated db.go to understand the API before writing service code.
+
+  Read 2 files (ctrl+o to expand)
+
+● Good. Now let me read models.go for the key types I'll need to reference.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now I have everything I need. Let me build the full structure. I'll initialize the module and create all directories first, then write
+  all files in parallel. 
+  
+  
+  
+#############################################################################################################################
+
+  uuid.NullUUID migration
+
+  sqlc.yaml now has two UUID overrides:
+  - nullable: false → uuid.UUID
+  - nullable: true → uuid.NullUUID
+
+  sqlc generate was re-run — all previously-pgtype.UUID fields in generated structs are now uuid.NullUUID. The service helpers were
+  renamed to toNullUUID(id) / toNullUUIDPtr(*id) and now return uuid.NullUUID{UUID: id, Valid: true} instead of pgtype.UUID{Bytes: id,
+  Valid: true}. The pgtype import in forecast.go is retained only for pgtype.Date.
+
+  ---
+  Taskfile.yml (replaces Makefile)
+
+  Key tasks: build, build-cli, build-server, run-server, run-cli, migrate-up, migrate-down, migrate-status, sqlc-gen, test, test-v, vet,
+  lint, tidy.
+
+  Usage: task run-cli -- version list or DATABASE_URL=postgres://... task migrate-up.
+
+  ---
+  Full project structure compiles clean (go build ./... && go vet ./... passes).
+
+##############################################################################################################################################################################
+##############################################################################################################################################################################
+
+● Everything is clean. Here is the full session summary.
+
+  ---
+  Session summary — workforceDbSchema
+
+  What was built this session
+
+  The project went from schema-only to a complete Go application skeleton. All code compiles and go vet passes.
+
+  ---
+  Complete project state
+
+  Schema layer (pre-existing, fully done)
+  - workforce_planning.dbml — DBML source of truth (dbdiagram.io)
+  - sql/migrations/001–004 — Goose SQL with all constraints, audit trigger, PG18 performance indexes
+  - sql/queries/ — sqlc-annotated SQL for all domain queries
+  - internal/db/ — sqlc-generated Go code (go build ./... clean)
+
+  Application layer (built this session)
+
+  ┌────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────┐
+  │                File                │                                   Status                                   │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/config/config.go          │ Done                                                                       │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/service/forecast.go       │ Done — SCD writes, ArchiveAndSeed, withAuditTx                             │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/service/actuals.go        │ Done — RunImport with pgx CopyFrom                                         │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/service/reporting.go      │ Done — rollup, diff, MoM delta                                             │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/api/router.go             │ Done — full chi route table                                                │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/api/middleware/auth.go    │ Stub — reads X-User-ID header (replace with JWT)                           │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/api/middleware/logger.go  │ Done — slog request logger                                                 │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/api/handler/costcenter.go │ Done — all 4 endpoints                                                     │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/api/handler/actuals.go    │ Done — import, list, rollup, MoM diff                                      │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/api/handler/forecast.go   │ Partial — rollup/diff/delete work; List/Get/Chain/History return stub JSON │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/cli/root.go               │ Done                                                                       │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/cli/import.go             │ Done wiring; rows parser is a stub (empty slice)                           │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/cli/rollover.go           │ Done                                                                       │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ internal/cli/version.go            │ Done — list + chain                                                        │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ cmd/cli/main.go                    │ Done                                                                       │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ cmd/server/main.go                 │ Done — decimal codec commented stub                                        │
+  └────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────┘
+
+  Tooling
+  - go.mod — module github.com/yourorg/workforce-planning
+  - Taskfile.yml — replaced Makefile; tasks: build, run-server, run-cli, migrate-up/down/status, sqlc-gen, test, vet, lint, tidy
+
+  sqlc.yaml changes
+  - uuid (nullable) now overrides to uuid.NullUUID — run task sqlc-gen after any schema change
+
+  Documentation
+  - docs/cli-usage.md — full CLI reference (created this session)
+  - docs/sqlc-usage.md — generated Go function guide (previous session)
+  - CLAUDE.md — fully updated with Go layer, patterns, route table
+
+  ---
+  Next logical steps
+
+  1. Add a file parser in internal/cli/import.go (CSV/Excel/JSON → []service.ImportRow)
+  2. Complete stub handlers in internal/api/handler/forecast.go (ListVersions, GetVersion, GetVersionChain, GetEntryHistory)
+  3. Replace stub auth in internal/api/middleware/auth.go with real JWT validation
+  4. Add the decimal codec — go get github.com/jackc/pgx-shopspring-decimal and uncomment the AfterConnect block in cmd/server/main.go
+  5. Write tests — testcontainers-go for service-layer integration tests (see docs/sqlc-usage.md)
+  6. Build the frontend — web/dist/ is ready for a Vite/HTMX bundle; add //go:embed web/dist to cmd/server/main.go when ready

@@ -99,10 +99,10 @@ ORDER BY path_names;   -- sorts naturally: parent names first, then children alp
 -- PLAN: one recursive scan starting from a single row; each step hits
 -- idx_costcenters_parent_id.  For a 3-level tree this is at most 3 iterations.
 WITH RECURSIVE descendants AS (
-    SELECT id, code, name, level, parent_id
-    FROM   costcenters
-    WHERE  id        = sqlc.arg(root_id)
-      AND  is_active = true
+    SELECT cc.id, cc.code, cc.name, cc.level, cc.parent_id
+    FROM   costcenters cc
+    WHERE  cc.id        = sqlc.arg(root_id)
+      AND  cc.is_active = true
 
     UNION ALL
 

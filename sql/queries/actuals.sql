@@ -150,16 +150,16 @@ ORDER BY ea.costcenter_id;
 -- Mark both CTEs MATERIALIZED so the planner runs each exactly once
 -- rather than trying to merge them into a single scan.
 WITH prev AS MATERIALIZED (
-    SELECT costcenter_id, SUM(fte) AS total_fte
-    FROM   employee_actuals
-    WHERE  import_run_id = sqlc.arg(prev_run_id)
-    GROUP  BY costcenter_id
+    SELECT ea.costcenter_id, SUM(ea.fte) AS total_fte
+    FROM   employee_actuals ea
+    WHERE  ea.import_run_id = sqlc.arg(prev_run_id)
+    GROUP  BY ea.costcenter_id
 ),
 curr AS MATERIALIZED (
-    SELECT costcenter_id, SUM(fte) AS total_fte
-    FROM   employee_actuals
-    WHERE  import_run_id = sqlc.arg(curr_run_id)
-    GROUP  BY costcenter_id
+    SELECT ea.costcenter_id, SUM(ea.fte) AS total_fte
+    FROM   employee_actuals ea
+    WHERE  ea.import_run_id = sqlc.arg(curr_run_id)
+    GROUP  BY ea.costcenter_id
 )
 SELECT
     COALESCE(curr.costcenter_id, prev.costcenter_id) AS costcenter_id,
@@ -167,5 +167,5 @@ SELECT
     curr.total_fte                                   AS curr_fte,
     COALESCE(curr.total_fte, 0) - COALESCE(prev.total_fte, 0) AS delta_fte
 FROM  curr
-FULL  OUTER JOIN prev USING (costcenter_id)
-ORDER BY costcenter_id;
+FULL  OUTER JOIN prev ON curr.costcenter_id = prev.costcenter_id
+ORDER BY COALESCE(curr.costcenter_id, prev.costcenter_id);
