@@ -13,15 +13,23 @@ PostgreSQL workforce planning database. Holds monthly SAP actual employee data (
 - Used as a reference when writing Goose SQL migrations
 - Used as a reference when writing sqlc query annotations
 
-## Planned toolchain
+## Toolchain
 
-| Tool | Purpose |
-|---|---|
-| **Goose** | SQL migration files in `migrations/` |
-| **sqlc** | Go code generation from annotated SQL queries |
-| **pgx/v5** | Target PostgreSQL driver for sqlc |
+| Tool | Purpose | Location |
+|---|---|---|
+| **Goose** | SQL migrations | `sql/migrations/` |
+| **sqlc** | Go code generation | config: `sqlc.yaml`, queries: `sql/queries/` |
+| **pgx/v5** | PostgreSQL driver | generated output: `internal/db/` |
 
-When writing Goose migrations, the first migration must include all `CHECK` constraints and the partial unique index listed at the top of `workforce_planning.dbml` — these are not expressible in DBML and are only noted there as comments.
+```sh
+# Apply migrations
+goose -dir sql/migrations postgres "<conn>" up
+
+# Regenerate Go DB layer (run after any query change)
+sqlc generate
+```
+
+The first migration (`001_initial_schema.sql`) includes all `CHECK` constraints and the partial unique index that are noted at the top of `workforce_planning.dbml` but cannot be expressed in DBML itself.
 
 ## Domain model
 

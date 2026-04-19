@@ -531,3 +531,49 @@ Trigger pseudocode:
 
 
 #############################################################################################################################################################################
+
+ What changed
+
+  README.md — two updates:
+  - Repository structure section now reflects the correct sql/migrations/ and sql/queries/ paths, plus the new docs/ folder and internal/db/ generated output
+  - Added quick-reference goose and sqlc generate commands directly in the README
+  - Toolchain section now links to the new docs file
+
+  CLAUDE.md — toolchain section updated with the correct paths and one-liner CLI commands for future Claude instances
+
+  ---
+  New file: docs/sqlc-usage.md
+
+  12 sections covering the entire generated layer:
+
+  ┌───────────────────────────┬──────────────────────────────────────────────────────────────────────────┐
+  │          Section          │                              What it covers                              │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 1. Setup                  │ Connection pool + AfterConnect codec registration for uuid and decimal   │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 2. Audit session variable │ SET LOCAL app.current_user_id in every write transaction                 │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 3. Lookups                │ ListClassificationTypes, UpsertSystemConfig                              │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 4. Costcenter hierarchy   │ Full tree for a picker, descendants for scoped reports                   │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 5. SAP import             │ InsertImportRun, bulk CopyFrom pattern, MoM delta                        │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 6. Version lifecycle      │ Create, archive, rollover month-end (full code example with transaction) │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 7. SCD Type 2 writes      │ Close-then-insert pattern, soft-delete                                   │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 8. Monthly CC rollup      │ Building the WebUI grid from MonthlyForecastRollupByCC                   │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 9. Version diff           │ CC-level and employee-level diff queries                                 │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 10. Audit log             │ Decoding the JSONB changed_fields diff                                   │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 11. WithTx pattern        │ How to scope *db.Queries to a transaction                                │
+  ├───────────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 12. Testing               │ Why to test against a real DB (not mocks), testcontainers-go setup       │
+  └───────────────────────────┴──────────────────────────────────────────────────────────────────────────┘
+
+✻ Brewed for 3m 6s
+
+#############################################################################################################################################################################
