@@ -1,0 +1,387 @@
+// ============================================================
+// Workforce Planning Database Schema
+// PostgreSQL — DBML format (dbdiagram.io / goose / sqlc)
+//
+// Sections:
+//   1. Lookup / reference tables
+//   2. Users & system configuration
+//   3. SAP employee identity
+//   4. Planning containers (virtual HC buckets)
+//   5. SAP import & actuals (immutable snapshots)
+//   6. Forecast versions & entries (SCD Type 2, versioned)
+//   7. Audit log
+//
+// NOTES ON CONSTRAINTS NOT EXPRESSIBLE IN DBML:
+//   - forecast_entries: CHECK that exactly one of employee_id / container_id is non-null
+//   - forecast_entries: CHECK valid_to IS NULL OR valid_to > valid_from
+//   - forecast_entries: CHECK EXTRACT(DAY FROM valid_from) = 1  (first-of-month)
+//   - forecast_entries: soft-delete triple consistency CHECK
+//   - forecast_versions: CHECK archived_* consistency with status
+//   - forecast_versions: PARTIAL UNIQUE INDEX on (status) WHERE status = 'working'
+//   See migration SQL for full constraint definitions.
+// ============================================================
+
+
+// ────────────────────────────────────────────────────────────
+// 1. LOOKUP / REFERENCE TABLES
+// ────────────────────────────────────────────────────────────
+
+Table costcenters {
+  id         uuid         [pk, default: `gen_random_uuid()`]
+  code       varchar(50)  [not null, unique, note: 'Short identifier, e.g. "CC-1234"']
+  name       varchar(255) [not null]
+  level      smallint     [not null, note: '1 = division  2 = department  3 = costcenter (leaf node). Informational — tree depth is not DB-enforced.']
+  parent_id  uuid         [ref: > costcenters.id, note: 'NULL for root nodes. Self-referential — walk with recursive CTE.']
+  is_active  boolean      [not null, default: true]
+  created_at timestamptz  [not null, default: `now()`]
+  updated_at timestamptz  [not null, default: `now()`]
+
+  indexes {
+    parent_id          [name: 'idx_costcenters_parent_id']
+    level              [name: 'idx_costcenters_level']
+    is_active          [name: 'idx_costcenters_is_active']
+  }
+
+  Note: 'Self-referential cost-center hierarchy. Example: Division (l1) → Department (l2) → Costcenter (l3). Use WITH RECURSIVE to aggregate FTE up the tree.'
+}
+
+Table employee_groups {
+  id         uuid        [pk, default: `gen_random_uuid()`]
+  code       varchar(50) [not null, unique, note: 'Machine key, e.g. "EG_EXEC"']
+  label      varchar(255) [not null, note: 'Display name, e.g. "Executive"']
+  sort_order smallint    [not null, default: 0]
+  is_active  boolean     [not null, default: true]
+
+  Note: 'Lookup table for the empl_group field. Seed: Executive, Manager, Engineer, Support, Operator, …'
+}
+
+Table classification_types {
+  id         uuid        [pk, default: `gen_random_uuid()`]
+  code       varchar(50) [not null, unique, note: 'Machine key, e.g. "direct", "indirect", "overhead", "contractor"']
+  label      varchar(255) [not null, note: 'Display name shown in UI and reports']
+  sort_order smallint    [not null, default: 0, note: 'Controls column / group ordering in the WebUI table']
+  is_active  boolean     [not null, default: true]
+
+  Note: 'Extensible replacement for a hard enum on the direct/indirect axis. Add new rows without ALTER TYPE. Seed: direct, indirect, overhead, contractor.'
+}
+
+
+// ────────────────────────────────────────────────────────────
+// 2. USERS & SYSTEM CONFIGURATION
+// ────────────────────────────────────────────────────────────
+
+Table users {
+  id           uuid         [pk, default: `gen_random_uuid()`]
+  email        varchar(255) [not null, unique]
+  display_name varchar(255) [not null]
+  is_active    boolean      [not null, default: true]
+  created_at   timestamptz  [not null, default: `now()`]
+  updated_at   timestamptz  [not null, default: `now()`]
+
+  Note: 'Application users — department heads, planners, admins, readers. All audit FK columns reference this table.'
+}
+
+Table system_config {
+  key         varchar(100) [pk, note: 'Setting name, e.g. "fc_horizon_months"']
+  value       text         [not null, note: 'String-encoded value — cast to the right type in the application layer']
+  description text         [note: 'Human-readable explanation of the key and allowed values']
+  updated_at  timestamptz  [not null, default: `now()`]
+  updated_by  uuid         [ref: > users.id]
+
+  Note: '''
+Known keys:
+  fc_horizon_months  — integer (default 18). Controls how many months forward the rolling forecast extends.
+  fc_lock_day        — integer 1–28 (default 1). Day of month on which the working FC is archived and a new one is opened.
+  import_source_label — string. Cosmetic label for the SAP import source shown in the UI.
+'''
+}
+
+
+// ────────────────────────────────────────────────────────────
+// 3. SAP EMPLOYEE IDENTITY
+// ────────────────────────────────────────────────────────────
+
+Table employees {
+  id         uuid        [pk, default: `gen_random_uuid()`]
+  // empl_uuid  uuid        [not null, unique, note: 'UUID provided by SAP — stable identity key, never changes']
+  employee_id    varchar(50) [not null, unique, note: 'SAP personnel number (Personalnummer)']
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: '''
+Thin identity anchor — one row per real SAP employee, ever.
+All mutable attributes (name, costcenter, FTE, …) live in employee_actuals (actuals side)
+or forecast_entries (forecast side).
+employee_id are the only stable cross-system keys and must never be updated.
+'''
+}
+
+
+// ────────────────────────────────────────────────────────────
+// 4. PLANNING CONTAINERS (virtual HC buckets)
+// ────────────────────────────────────────────────────────────
+
+Table planning_containers {
+  id           uuid         [pk, default: `gen_random_uuid()`]
+  empl_plan_no varchar(50)  [not null, unique, note: 'Human-readable virtual ID, e.g. "PLAN-CC100-001". Analogous to empl_no.']
+  costcenter_id uuid        [not null, ref: > costcenters.id, note: 'Default / home costcenter. Can be overridden per forecast_entry row.']
+  label        varchar(255) [not null, note: 'e.g. "HC Growth Q3 — Engineering"']
+  notes        text
+  is_active    boolean      [not null, default: true]
+  created_by   uuid         [not null, ref: > users.id]
+  created_at   timestamptz  [not null, default: `now()`]
+  updated_at   timestamptz  [not null, default: `now()`]
+
+  indexes {
+    costcenter_id [name: 'idx_planning_containers_cc']
+    is_active     [name: 'idx_planning_containers_active']
+  }
+
+  Note: '''
+Virtual planning buckets with no SAP origin.
+FTE rules (enforced in application layer / partial CHECK in migration):
+  FTE > 0  → planned headcount addition
+  FTE < 0  → planned headcount reduction (negative FTE allowed)
+  FTE > 1  → multi-head bucket, e.g. plan to hire 3 people simultaneously
+The costcenter_id here is the default; a specific forecast_entry may carry a different costcenter_id
+if the container is reassigned during the forecast horizon.
+'''
+}
+
+
+// ────────────────────────────────────────────────────────────
+// 5. SAP IMPORT & ACTUALS  (immutable monthly snapshots)
+// ────────────────────────────────────────────────────────────
+
+Table import_runs {
+  id            uuid        [pk, default: `gen_random_uuid()`]
+  period_year   smallint    [not null, note: 'Calendar/fiscal year of the actuals period, e.g. 2025']
+  period_month  smallint    [not null, note: '1–12']
+  status        varchar(50) [not null, default: 'completed', note: 'completed | failed | partial']
+  row_count     int         [note: 'Number of employee rows loaded in this run']
+  source_file   varchar(500) [note: 'Optional — S3 key, local filename, or SAP export batch ID']
+  imported_by   uuid        [not null, ref: > users.id]
+  imported_at   timestamptz [not null, default: `now()`]
+
+  indexes {
+    (period_year, period_month) [unique, name: 'uq_import_runs_period']
+    status                      [name: 'idx_import_runs_status']
+  }
+
+  Note: '''
+One row per monthly SAP import execution.
+The unique constraint on (period_year, period_month) enforces exactly one official actuals
+snapshot per calendar month. A re-import requires an explicit admin operation to delete or
+supersede the prior run before re-importing.
+'''
+}
+
+Table employee_actuals {
+  id                uuid         [pk, default: `gen_random_uuid()`]
+  import_run_id     uuid         [not null, ref: > import_runs.id]
+  employee_id       uuid         [not null, ref: > employees.id]
+
+  // Full attribute snapshot at time of import — never updated after INSERT
+  first_name        varchar(255) [not null]
+  last_name         varchar(255) [not null]
+  costcenter_id     uuid         [not null, ref: > costcenters.id]
+  classification_id uuid         [ref: > classification_types.id, note: 'direct / indirect / overhead / contractor … — NULL only if SAP did not supply a value']
+  employee_group_id uuid         [ref: > employee_groups.id,      note: 'NULL only if SAP did not supply a value']
+  job_description   varchar(500)
+  fte               numeric(6,4) [not null, note: 'Full-time equivalent; e.g. 1.0000 or 0.5000. Always positive for real employees.']
+
+  created_at        timestamptz  [not null, default: `now()`]
+
+  indexes {
+    (import_run_id, employee_id) [unique, name: 'uq_employee_actuals_run_empl']
+    import_run_id                [name: 'idx_employee_actuals_run']
+    employee_id                  [name: 'idx_employee_actuals_empl']
+    costcenter_id                [name: 'idx_employee_actuals_cc']
+    (import_run_id, costcenter_id) [name: 'idx_employee_actuals_run_cc', note: 'Critical for actuals-side CC rollup queries']
+  }
+
+  Note: '''
+IMMUTABLE after insert. Application code must never issue UPDATE or DELETE.
+One row = one employee state for one monthly import run.
+
+Actuals comparison patterns:
+  MoM delta          → join two import_run_id values (last actual vs current actual)
+  Actual vs FC end   → join current import_run_id against forecast_entries for the target month
+
+SQL CHECK to add in migration (sanity guard):
+  CHECK (fte > 0 AND fte <= 10)
+'''
+}
+
+
+// ────────────────────────────────────────────────────────────
+// 6. FORECAST VERSIONS & ENTRIES  (versioned, SCD Type 2)
+// ────────────────────────────────────────────────────────────
+
+Table forecast_versions {
+  id                uuid        [pk, default: `gen_random_uuid()`]
+  label             varchar(255) [not null, note: 'e.g. "Working Forecast" or "Snapshot 2025-03"']
+  status            varchar(20)  [not null, default: 'working', note: 'working | archived']
+  period_year       smallint    [not null, note: 'Year this version was opened / created for']
+  period_month      smallint    [not null, note: '1–12 — month this version was opened / created for']
+  fc_horizon_months smallint    [not null, note: 'Snapshot of fc_horizon_months system_config at version creation time. Defines how far this FC extends.']
+
+  // Lineage — links to the snapshot this working FC was seeded from
+  source_version_id uuid        [ref: > forecast_versions.id, note: 'FK to self. NULL for the very first version. Forms a singly-linked list: working → snapshot_N → snapshot_N-1 → …']
+
+  // Archival timestamps — set when status transitions working → archived
+  archived_at       timestamptz [note: 'NULL while status = working']
+  archived_by       uuid        [ref: > users.id, note: 'NULL while status = working']
+
+  created_by        uuid        [not null, ref: > users.id]
+  created_at        timestamptz [not null, default: `now()`]
+
+  indexes {
+    (period_year, period_month) [name: 'idx_fc_versions_period']
+    status                      [name: 'idx_fc_versions_status']
+    source_version_id           [name: 'idx_fc_versions_source']
+  }
+
+  Note: '''
+Version lifecycle:
+  1. First ever: INSERT status=working, source_version_id=NULL.
+  2. Month-end: UPDATE status=archived, archived_at, archived_by.
+  3. New working: INSERT status=working, source_version_id = just-archived id.
+     Application seeds new forecast_entries by copying current open-ended rows from the prior snapshot.
+  4. Repeat monthly.
+
+PARTIAL UNIQUE INDEX (must be added in migration — cannot be expressed in DBML):
+  CREATE UNIQUE INDEX uq_fc_versions_one_working
+    ON forecast_versions (status) WHERE status = 'working';
+  This enforces at most one working version at any time.
+
+ARCHIVED CONSISTENCY CHECK (add in migration):
+  CHECK ((status = archived  AND archived_at IS NOT NULL AND archived_by IS NOT NULL)
+      OR (status = working   AND archived_at IS NULL     AND archived_by IS NULL))
+
+VERSION COMPARISON:
+  To diff version A vs version B for month M, query forecast_entries
+  filtered by each version_id and valid_from/valid_to, then FULL OUTER JOIN
+  on COALESCE(employee_id::text, container_id::text).
+'''
+}
+
+Table forecast_entries {
+  id                uuid         [pk, default: `gen_random_uuid()`]
+  version_id        uuid         [not null, ref: > forecast_versions.id]
+
+  // Subject — exactly ONE must be non-null (enforced by CHECK constraint in migration).
+  employee_id       uuid         [ref: > employees.id,         note: 'Set for real SAP employees. Mutually exclusive with container_id.']
+  container_id      uuid         [ref: > planning_containers.id, note: 'Set for planning buckets.  Mutually exclusive with employee_id.']
+
+  // Full attribute snapshot — SCD Type 2 style (complete copy of state at each change)
+  first_name        varchar(255) [not null]
+  last_name         varchar(255) [not null]
+  costcenter_id     uuid         [not null, ref: > costcenters.id]
+  classification_id uuid         [ref: > classification_types.id]
+  employee_group_id uuid         [ref: > employee_groups.id]
+  job_description   varchar(500)
+  fte               numeric(6,4) [not null, note: 'Negative = planned reduction (containers only). Greater than 1 = multi-head bucket. Positive decimal for real employees.']
+
+  // SCD Type 2 temporal bounds — month granularity, first-day-of-month values
+  valid_from        date         [not null, note: 'Inclusive start — always first day of month, e.g. 2025-04-01. CHECK EXTRACT(DAY FROM valid_from) = 1 in migration.']
+  valid_to          date         [note: 'Exclusive end — first day of the superseding month. NULL = open-ended / currently active row. CHECK valid_to IS NULL OR valid_to > valid_from.']
+
+  // Soft delete — all three must be NULL/false or all set (enforced by CHECK in migration)
+  is_deleted        boolean      [not null, default: false]
+  deleted_at        timestamptz
+  deleted_by        uuid         [ref: > users.id]
+
+  // Audit — who created this specific row version
+  created_by        uuid         [not null, ref: > users.id]
+  created_at        timestamptz  [not null, default: `now()`]
+
+  indexes {
+    // Core rollup index — monthly CC headcount summary for the WebUI table (most performance-critical)
+    (version_id, costcenter_id, valid_from) [name: 'idx_fe_version_cc_from']
+
+    // Active-row lookup for a specific real employee
+    (version_id, employee_id, valid_from)   [name: 'idx_fe_version_empl_from']
+
+    // Active-row lookup for a specific planning container
+    (version_id, container_id, valid_from)  [name: 'idx_fe_version_cont_from']
+
+    // Temporal range scan across all subjects in a version
+    (version_id, valid_from)                [name: 'idx_fe_version_valid_from']
+
+    // Soft-delete filter
+    is_deleted                              [name: 'idx_fe_is_deleted']
+  }
+
+  Note: '''
+SCD Type 2 — each change to a subject's planned attributes:
+  1. Closes the current open-ended row: UPDATE valid_to = change_month WHERE valid_to IS NULL.
+  2. Inserts a new row with the new attribute values and valid_from = change_month, valid_to = NULL.
+
+Active-row query for a given month:
+  WHERE version_id = $v
+    AND valid_from <= $month_start
+    AND (valid_to IS NULL OR valid_to > $month_start)
+    AND is_deleted = false
+
+CHECK CONSTRAINTS (add in migration — DBML cannot express these):
+
+  1. Mutually exclusive subject:
+     CHECK ((employee_id IS NOT NULL AND container_id IS NULL)
+         OR (employee_id IS NULL     AND container_id IS NOT NULL))
+
+  2. Temporal sanity:
+     CHECK (valid_to IS NULL OR valid_to > valid_from)
+
+  3. valid_from is always first-of-month:
+     CHECK (EXTRACT(DAY FROM valid_from) = 1)
+
+  4. Soft-delete consistency:
+     CHECK ((is_deleted = false AND deleted_by IS NULL  AND deleted_at IS NULL)
+         OR (is_deleted = true  AND deleted_by IS NOT NULL AND deleted_at IS NOT NULL))
+'''
+}
+
+
+// ────────────────────────────────────────────────────────────
+// 7. AUDIT LOG
+// ────────────────────────────────────────────────────────────
+
+Table forecast_entry_audit {
+  id                uuid        [pk, default: `gen_random_uuid()`]
+  forecast_entry_id uuid        [not null, ref: > forecast_entries.id]
+  version_id        uuid        [not null, ref: > forecast_versions.id, note: 'Denormalised from forecast_entries for fast per-version audit queries']
+
+  action            varchar(20) [not null, note: 'INSERT | UPDATE | DELETE | RESTORE']
+  changed_fields    jsonb       [note: 'Object keyed by field name: {"fte": {"old": 1.0, "new": 0.5}, "costcenter_id": {"old": "...", "new": "..."}}. NULL or omitted keys on INSERT (no prior state). On DELETE, full snapshot stored under "deleted_snapshot".']
+
+  changed_by        uuid        [not null, ref: > users.id]
+  changed_at        timestamptz [not null, default: `now()`]
+
+  // Optional request metadata for traceability
+  client_ip         varchar(45) [note: 'IPv4 or IPv6 address from the HTTP request context']
+  user_agent        text        [note: 'Browser / API client identifier']
+
+  indexes {
+    forecast_entry_id           [name: 'idx_fea_entry_id']
+    version_id                  [name: 'idx_fea_version_id']
+    changed_by                  [name: 'idx_fea_changed_by']
+    changed_at                  [name: 'idx_fea_changed_at']
+    (version_id, changed_at)    [name: 'idx_fea_version_time', note: 'Per-version change timeline — used by the change-history panel in the UI']
+    (forecast_entry_id, changed_at) [name: 'idx_fea_entry_time']
+  }
+
+  Note: '''
+APPEND-ONLY — no UPDATE or DELETE is ever issued against this table.
+Insert one row per write operation on forecast_entries.
+
+Recommended implementation: PostgreSQL AFTER trigger on forecast_entries
+that fires on INSERT, UPDATE, DELETE and writes the diff into this table.
+This guarantees coverage regardless of which application path writes the entry.
+
+Trigger pseudocode:
+  AFTER INSERT  → action = INSERT,  changed_fields = NULL (or full new-state snapshot)
+  AFTER UPDATE  → action = UPDATE,  changed_fields = diff(OLD, NEW) for modified columns only
+  AFTER UPDATE SET is_deleted = true → action = DELETE, changed_fields includes deleted_snapshot
+  AFTER UPDATE SET is_deleted = false (undo) → action = RESTORE
+'''
+}
