@@ -1,6 +1,6 @@
 -- ============================================================
 -- queries/actuals.sql
--- SAP import tracking and employee_actuals queries.
+-- SAP/Excel import tracking and employee_actuals queries.
 --
 -- All employee_actuals rows are IMMUTABLE after insert.
 -- There are no UPDATE or DELETE queries in this file by design.
